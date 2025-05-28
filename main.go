@@ -59,7 +59,7 @@ var (
 	mutex        sync.Mutex
 )
 
-const maxWorkers = 10000
+const maxWorkers = 100000
 
 func main() {
 	proto := ask("Choose protocol (http, socks4, socks5, all): ")
