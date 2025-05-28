@@ -174,15 +174,16 @@ func getIPInfo(ip string) *IPInfo {
 	if len(parts) < 1 {
 		return nil
 	}
+
 	resp, err := http.Get("http://ip-api.com/json/" + parts[0])
-	if err != nil {
+	if err != nil || resp.StatusCode != 200 {
 		return nil
 	}
 	defer resp.Body.Close()
 
 	var info IPInfo
 	err = json.NewDecoder(resp.Body).Decode(&info)
-	if err != nil {
+	if err != nil || info.Country == "" {
 		return nil
 	}
 	return &info
