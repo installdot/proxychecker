@@ -7,18 +7,19 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 	"os/exec"
 	"runtime"
+
 	"golang.org/x/net/proxy"
 )
 
 var (
 	httpSources = []string{
+		"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&timeout=20000",
 		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
 		"https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/http/data.txt",
 		"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/refs/heads/main/http.txt",
@@ -52,11 +53,6 @@ type ProxyResult struct {
 	Proto   string
 }
 
-type BatchIPInfo struct {
-	Query   string `json:"query"`
-	Country string `json:"country"`
-}
-
 var (
 	totalChecked int
 	totalFound   int
@@ -65,138 +61,66 @@ var (
 )
 
 const (
-	maxWorkers      = 10000           // Increased for faster processing
-	timeoutDuration = 3 * time.Second // Reduced timeout
+	maxWorkers      = 100
+	timeoutDuration = 5 * time.Second
 	testURL         = "http://example.com"
-	batchSize       = 100           // ip-api.com allows 45 IPs per batch
 )
 
 func main() {
 	proto := ask("Choose protocol (http, socks4, socks5, all): ")
 	country := strings.ToUpper(ask("Choose country (e.g., VN, DE, EN, ALL): "))
 
-	fmt.Println("Fetching proxies...")
 	var allProxies []ProxyResult
-	var wg sync.WaitGroup
+	fmt.Println("Fetching proxies...")
 
-	// Fetch proxy lists concurrently
-	proxiesChan := make(chan []ProxyResult, len(httpSources)+len(socks4Sources)+len(socks5Sources))
 	if proto == "http" || proto == "all" {
-		for _, src := range httpSources {
-			wg.Add(1)
-			go func(src string) {
-				defer wg.Done()
-				proxiesChan <- fetchProxies(src, "http")
-			}(src)
-		}
+		allProxies = append(allProxies, fetchProxies(httpSources, "http")...)
 	}
 	if proto == "socks4" || proto == "all" {
-		for _, src := range socks4Sources {
-			wg.Add(1)
-			go func(src string) {
-				defer wg.Done()
-				proxiesChan <- fetchProxies(src, "socks4")
-			}(src)
-		}
+		allProxies = append(allProxies, fetchProxies(socks4Sources, "socks4")...)
 	}
 	if proto == "socks5" || proto == "all" {
-		for _, src := range socks5Sources {
-			wg.Add(1)
-			go func(src string) {
-				defer wg.Done()
-				proxiesChan <- fetchProxies(src, "socks5")
-			}(src)
-		}
+		allProxies = append(allProxies, fetchProxies(socks5Sources, "socks5")...)
 	}
 
-	// Collect fetched proxies
-	go func() {
-		wg.Wait()
-		close(proxiesChan)
-	}()
-	for proxies := range proxiesChan {
-		allProxies = append(allProxies, proxies...)
-	}
-
-	// Deduplicate proxies early
-	uniqueProxies := deduplicateProxies(allProxies)
-	fmt.Printf("Fetched %d unique proxies. Checking...\n", len(uniqueProxies))
+	fmt.Printf("Fetched %d proxies. Checking...\n", len(allProxies))
 
 	proxyChan := make(chan ProxyResult, maxWorkers)
-	var checkWg sync.WaitGroup
+	var wg sync.WaitGroup
 
-	// Start workers
 	for i := 0; i < maxWorkers; i++ {
-		checkWg.Add(1)
-		go worker(proxyChan, &checkWg, country)
+		wg.Add(1)
+		go worker(proxyChan, &wg, country)
 	}
 
-	// Send proxies to workers
-	for _, p := range uniqueProxies {
+	for _, p := range allProxies {
 		proxyChan <- p
 	}
 	close(proxyChan)
-	checkWg.Wait()
+	wg.Wait()
 
 	fmt.Println("\nScan complete.")
 }
 
 func worker(proxyChan <-chan ProxyResult, wg *sync.WaitGroup, country string) {
 	defer wg.Done()
-	var proxies []ProxyResult
 	for p := range proxyChan {
 		if checkProxy(p) {
-			proxies = append(proxies, p)
+			info := getIPInfo(p.Address)
+			if info != nil && info.Country != "" && (strings.ToUpper(info.Country) == country || country == "ALL") {
+				mutex.Lock()
+				if !proxySet[p.Address] { // Check for duplicates
+					proxySet[p.Address] = true
+					saveProxy(p.Proto, strings.ToUpper(info.Country), p.Address)
+					totalFound++
+				}
+				mutex.Unlock()
+			}
 		}
 		mutex.Lock()
 		totalChecked++
-		if totalChecked%10 == 0 { // Update stats less frequently
-			printStats(country, p.Proto)
-		}
+		printStats(country, p.Proto)
 		mutex.Unlock()
-
-		// Process in batches
-		if len(proxies) >= batchSize {
-			processBatch(proxies, country)
-			proxies = proxies[:0]
-		}
-	}
-	// Process remaining proxies
-	if len(proxies) > 0 {
-		processBatch(proxies, country)
-	}
-}
-
-func processBatch(proxies []ProxyResult, country string) {
-	if len(proxies) == 0 {
-		return
-	}
-
-	// Batch IP info lookup
-	ips := make([]string, 0, len(proxies))
-	for _, p := range proxies {
-		parts := strings.Split(p.Address, ":")
-		if len(parts) > 0 {
-			ips = append(ips, parts[0])
-		}
-	}
-	infoMap := getBatchIPInfo(ips)
-
-	mutex.Lock()
-	defer mutex.Unlock()
-	for _, p := range proxies {
-		parts := strings.Split(p.Address, ":")
-		if len(parts) < 1 {
-			continue
-		}
-		info, exists := infoMap[parts[0]]
-		if exists && info.Country != "" && (strings.ToUpper(info.Country) == country || country == "ALL") {
-			if !proxySet[p.Address] {
-				proxySet[p.Address] = true
-				saveProxy(p.Proto, strings.ToUpper(info.Country), p.Address)
-				totalFound++
-			}
-		}
 	}
 }
 
@@ -207,43 +131,31 @@ func ask(prompt string) string {
 	return strings.TrimSpace(text)
 }
 
-func fetchProxies(src, proto string) []ProxyResult {
+func fetchProxies(sources []string, proto string) []ProxyResult {
 	var results []ProxyResult
-	client := &http.Client{Timeout: timeoutDuration}
-	resp, err := client.Get(src)
-	if err != nil {
-		fmt.Printf("Failed to fetch %s: %v\n", src, err)
-		return results
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	lines := strings.Split(string(body), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for _, src := range sources {
+		client := &http.Client{Timeout: timeoutDuration}
+		resp, err := client.Get(src)
+		if err != nil {
+			fmt.Printf("Failed to fetch %s: %v\n", src, err)
 			continue
 		}
-		line = strings.TrimPrefix(line, proto+"://")
-		if _, err := net.ResolveTCPAddr("tcp", line); err == nil {
-			results = append(results, ProxyResult{Address: line, Proto: proto})
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		lines := strings.Split(string(body), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			line = strings.TrimPrefix(line, proto+"://")
+			if _, err := net.ResolveTCPAddr("tcp", line); err == nil { // Basic validation
+				results = append(results, ProxyResult{Address: line, Proto: proto})
+			}
 		}
 	}
 	return results
-}
-
-func deduplicateProxies(proxies []ProxyResult) []ProxyResult {
-	seen := make(map[string]ProxyResult)
-	for _, p := range proxies {
-		if _, exists := seen[p.Address]; !exists {
-			seen[p.Address] = p
-		}
-	}
-	var unique []ProxyResult
-	for _, p := range seen {
-		unique = append(unique, p)
-	}
-	return unique
 }
 
 func checkProxy(p ProxyResult) bool {
@@ -271,11 +183,7 @@ func checkProxy(p ProxyResult) bool {
 		return false
 	}
 
-	req, err := http.NewRequest("HEAD", testURL, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := client.Do(req)
+	resp, err := client.Get(testURL)
 	if err != nil {
 		return false
 	}
@@ -283,36 +191,25 @@ func checkProxy(p ProxyResult) bool {
 	return resp.StatusCode == 200
 }
 
-func getBatchIPInfo(ips []string) map[string]BatchIPInfo {
-	infoMap := make(map[string]BatchIPInfo)
-	if len(ips) == 0 {
-		return infoMap
+func getIPInfo(ip string) *IPInfo {
+	parts := strings.Split(ip, ":")
+	if len(parts) < 1 {
+		return nil
 	}
 
-	// Prepare batch request
-	data := make(map[string][]string)
-	data["queries"] = ips
-	body, _ := json.Marshal(data)
-
 	client := &http.Client{Timeout: timeoutDuration}
-	resp, err := client.Post("http://ip-api.com/batch", "application/json", bytes.NewReader(body))
+	resp, err := client.Get("http://ip-api.com/json/" + parts[0])
 	if err != nil || resp.StatusCode != 200 {
-		return infoMap
+		return nil
 	}
 	defer resp.Body.Close()
 
-	var infos []BatchIPInfo
-	err = json.NewDecoder(resp.Body).Decode(&infos)
-	if err != nil {
-		return infoMap
+	var info IPInfo
+	err = json.NewDecoder(resp.Body).Decode(&info)
+	if err != nil || info.Country == "" {
+		return nil
 	}
-
-	for _, info := range infos {
-		if info.Country != "" {
-			infoMap[info.Query] = info
-		}
-	}
-	return infoMap
+	return &info
 }
 
 func saveProxy(proto, country, address string) {
