@@ -13,7 +13,6 @@ import (
 	"time"
 	"os/exec"
 	"runtime"
-	
 
 	"golang.org/x/net/proxy"
 )
@@ -57,9 +56,14 @@ var (
 	totalChecked int
 	totalFound   int
 	mutex        sync.Mutex
+	proxySet     = make(map[string]bool) // Track unique proxies
 )
 
-const maxWorkers = 100000
+const (
+	maxWorkers      = 100
+	timeoutDuration = 5 * time.Second
+	testURL         = "http://example.com"
+)
 
 func main() {
 	proto := ask("Choose protocol (http, socks4, socks5, all): ")
@@ -102,10 +106,13 @@ func worker(proxyChan <-chan ProxyResult, wg *sync.WaitGroup, country string) {
 	for p := range proxyChan {
 		if checkProxy(p) {
 			info := getIPInfo(p.Address)
-			if info != nil && (strings.ToUpper(info.Country) == country || country == "ALL") {
-				saveProxy(p.Proto, info.Country, p.Address)
+			if info != nil && info.Country != "" && (strings.ToUpper(info.Country) == country || country == "ALL") {
 				mutex.Lock()
-				totalFound++
+				if !proxySet[p.Address] { // Check for duplicates
+					proxySet[p.Address] = true
+					saveProxy(p.Proto, strings.ToUpper(info.Country), p.Address)
+					totalFound++
+				}
 				mutex.Unlock()
 			}
 		}
@@ -126,8 +133,10 @@ func ask(prompt string) string {
 func fetchProxies(sources []string, proto string) []ProxyResult {
 	var results []ProxyResult
 	for _, src := range sources {
-		resp, err := http.Get(src)
+		client := &http.Client{Timeout: timeoutDuration}
+		resp, err := client.Get(src)
 		if err != nil {
+			fmt.Printf("Failed to fetch %s: %v\n", src, err)
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
@@ -140,33 +149,45 @@ func fetchProxies(sources []string, proto string) []ProxyResult {
 				continue
 			}
 			line = strings.TrimPrefix(line, proto+"://")
-			results = append(results, ProxyResult{Address: line, Proto: proto})
+			if _, err := net.ResolveTCPAddr("tcp", line); err == nil { // Basic validation
+				results = append(results, ProxyResult{Address: line, Proto: proto})
+			}
 		}
 	}
 	return results
 }
 
 func checkProxy(p ProxyResult) bool {
-	timeout := 4 * time.Second
+	client := &http.Client{
+		Timeout: timeoutDuration,
+	}
+
 	switch p.Proto {
 	case "http":
-		conn, err := net.DialTimeout("tcp", p.Address, timeout)
-		if err == nil {
-			conn.Close()
-			return true
+		client.Transport = &http.Transport{
+			Proxy: http.ProxyURL(&url.URL{
+				Scheme: "http",
+				Host:   p.Address,
+			}),
 		}
 	case "socks4", "socks5":
-		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, &net.Dialer{Timeout: timeout})
+		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, &net.Dialer{Timeout: timeoutDuration})
 		if err != nil {
 			return false
 		}
-		conn, err := dialer.Dial("tcp", "example.com:80")
-		if err == nil {
-			conn.Close()
-			return true
+		client.Transport = &http.Transport{
+			Dial: dialer.Dial,
 		}
+	default:
+		return false
 	}
-	return false
+
+	resp, err := client.Get(testURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
 }
 
 func getIPInfo(ip string) *IPInfo {
@@ -175,7 +196,8 @@ func getIPInfo(ip string) *IPInfo {
 		return nil
 	}
 
-	resp, err := http.Get("http://ip-api.com/json/" + parts[0])
+	client := &http.Client{Timeout: timeoutDuration}
+	resp, err := client.Get("http://ip-api.com/json/" + parts[0])
 	if err != nil || resp.StatusCode != 200 {
 		return nil
 	}
@@ -191,15 +213,18 @@ func getIPInfo(ip string) *IPInfo {
 
 func saveProxy(proto, country, address string) {
 	os.MkdirAll("proxies", 0755)
-	fileName := fmt.Sprintf("proxies/%s_%s_proxy.txt", strings.ToUpper(country), proto)
-	f, _ := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	fileName := fmt.Sprintf("proxies/%s_%s_proxy.txt", country, proto)
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Failed to open file %s: %v\n", fileName, err)
+		return
+	}
 	defer f.Close()
 	f.WriteString(address + "\n")
 }
 
 func printStats(country, proto string) {
 	clearConsole()
-
 	line := fmt.Sprintf("Total Checked: %d | Country: %s | Type: %s | Live Found: %d",
 		totalChecked, country, proto, totalFound)
 	fmt.Println(line)
